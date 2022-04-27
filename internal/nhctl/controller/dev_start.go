@@ -174,56 +174,64 @@ func (c *Controller) genWorkDirAndPVAndMounts(container, storageClass string, ig
 		}
 
 		// Check if pvc is already exist
-		labels := map[string]string{}
-		if duplicateDevMode {
-			labels = c.getDuplicateLabelsMap()
-			labels[_const.DevWorkloadIgnored] = "false"
-			labels[_const.AppLabel] = c.AppName
-			labels[_const.ServiceLabel] = c.Name
-			labels[_const.ServiceTypeLabel] = string(c.Type)
-		} else {
-			labels[_const.AppLabel] = c.AppName
-			labels[_const.ServiceLabel] = c.Name
-			labels[_const.ServiceTypeLabel] = string(c.Type)
-		}
-		labels[_const.PersistentVolumeDirLabel] = utils.Sha1ToString(persistentVolume.Path)
-		claims, err := c.Client.GetPvcByLabels(labels)
-		if err != nil {
-			log.WarnE(err, fmt.Sprintf("Fail to get a pvc for %s", persistentVolume.Path))
-			continue
-		}
-		if len(claims) > 1 {
-			log.Warn(
-				fmt.Sprintf(
-					"Find %d pvc for %s, expected 1, skipping this dir", len(claims), persistentVolume.Path,
-				),
-			)
-			continue
-		}
-
 		var claimName string
-		if len(claims) == 1 { // pvc for this path found
-			claimName = claims[0].Name
-		} else { // no pvc for this path, create one
-			var pvc *corev1.PersistentVolumeClaim
-			if c.GetStorageClass(container) != "" {
-				storageClass = c.GetStorageClass(container)
+		var mountPath = persistentVolume.Path
+		if strings.Contains(persistentVolume.Path, ":") {
+			// hack special logic for existing PVC which not be created by nocalhost
+			pvcPairs := strings.Split(persistentVolume.Path, ":")
+			mountPath = pvcPairs[0]
+			claimName = pvcPairs[1]
+		} else {
+			labels := map[string]string{}
+			if duplicateDevMode {
+				labels = c.getDuplicateLabelsMap()
+				labels[_const.DevWorkloadIgnored] = "false"
+				labels[_const.AppLabel] = c.AppName
+				labels[_const.ServiceLabel] = c.Name
+				labels[_const.ServiceTypeLabel] = string(c.Type)
+			} else {
+				labels[_const.AppLabel] = c.AppName
+				labels[_const.ServiceLabel] = c.Name
+				labels[_const.ServiceTypeLabel] = string(c.Type)
 			}
-			log.Infof(
-				"No PVC for %s found, trying to create one with storage class %s...",
-				persistentVolume.Path, storageClass,
-			)
-			pvc, err = c.createPvcForPersistentVolumeDir(persistentVolume, labels, storageClass)
-			if err != nil || pvc == nil {
-				return nil, nil, errors.Wrap(
-					nocalhost.CreatePvcFailed, "Failed to create pvc for "+persistentVolume.Path,
+			labels[_const.PersistentVolumeDirLabel] = utils.Sha1ToString(persistentVolume.Path)
+			claims, err := c.Client.GetPvcByLabels(labels)
+			if err != nil {
+				log.WarnE(err, fmt.Sprintf("Fail to get a pvc for %s", persistentVolume.Path))
+				continue
+			}
+			if len(claims) > 1 {
+				log.Warn(
+					fmt.Sprintf(
+						"Find %d pvc for %s, expected 1, skipping this dir", len(claims), persistentVolume.Path,
+					),
 				)
+				continue
 			}
-			claimName = pvc.Name
+
+			if len(claims) == 1 { // pvc for this path found
+				claimName = claims[0].Name
+			} else { // no pvc for this path, create one
+				var pvc *corev1.PersistentVolumeClaim
+				if c.GetStorageClass(container) != "" {
+					storageClass = c.GetStorageClass(container)
+				}
+				log.Infof(
+					"No PVC for %s found, trying to create one with storage class %s...",
+					persistentVolume.Path, storageClass,
+				)
+				pvc, err = c.createPvcForPersistentVolumeDir(persistentVolume, labels, storageClass)
+				if err != nil || pvc == nil {
+					return nil, nil, errors.Wrap(
+						nocalhost.CreatePvcFailed, "Failed to create pvc for "+persistentVolume.Path,
+					)
+				}
+				claimName = pvc.Name
+			}
 		}
 
 		// Do not use emptyDir for workDir
-		if persistentVolume.Path == workDir {
+		if mountPath == workDir {
 			workDirDefinedInPersistVolume = true
 			workDirVol.EmptyDir = nil
 			workDirVol.PersistentVolumeClaim = &corev1.PersistentVolumeClaimVolumeSource{
@@ -232,7 +240,7 @@ func (c *Controller) genWorkDirAndPVAndMounts(container, storageClass string, ig
 
 			log.Info("WorkDir uses persistent volume defined in persistVolumeDirs")
 			continue
-		} else if strings.HasPrefix(workDir, persistentVolume.Path) && !workDirDefinedInPersistVolume {
+		} else if strings.HasPrefix(workDir, mountPath) && !workDirDefinedInPersistVolume {
 			log.Infof("WorkDir:%s resides in the persist dir: %s", workDir, persistentVolume.Path)
 			// No need to mount workDir
 			workDirResideInPersistVolumeDirs = true
@@ -249,13 +257,13 @@ func (c *Controller) genWorkDirAndPVAndMounts(container, storageClass string, ig
 		}
 		persistentMount := corev1.VolumeMount{
 			Name:      persistVolName,
-			MountPath: persistentVolume.Path,
+			MountPath: mountPath,
 		}
 
 		volumes = append(volumes, persistentVol)
 		volumeMounts = append(volumeMounts, persistentMount)
 
-		log.Infof("%s mounts a pvc successfully", persistentVolume.Path)
+		log.Infof("%s mounts a pvc successfully", mountPath)
 	}
 
 	if (workDirDefinedInPersistVolume || !workDirResideInPersistVolumeDirs) && !ignoreWorkDir {
@@ -654,8 +662,8 @@ func (c *Controller) genContainersAndVolumes(podSpec *corev1.PodSpec,
 	}
 
 	r := &profile.ResourceQuota{
-		Limits:   &profile.QuotaList{Memory: "1Gi", Cpu: "1"},
-		Requests: &profile.QuotaList{Memory: "50Mi", Cpu: "100m"},
+		Limits:   &profile.QuotaList{Memory: "256Mi", Cpu: "1"},
+		Requests: &profile.QuotaList{Memory: "128Mi", Cpu: "100m"},
 	}
 	rq, _ := convertResourceQuota(r)
 	sideCarContainer.Resources = *rq
